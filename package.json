@@ -1,0 +1,28 @@
+{
+  "name": "trak",
+  "version": "0.1.0",
+  "description": "Minimal TypeScript CLI for time tracking",
+  "main": "dist/cli.js",
+  "bin": {
+    "trak": "dist/cli.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "trak": "node dist/cli.js",
+    "prepare": "npm run build"
+  },
+  "keywords": [
+    "trak",
+    "time-tracking",
+    "cli",
+    "typescript"
+  ],
+  "license": "MIT",
+  "devDependencies": {
+    "@types/node": "^24.6.0",
+    "typescript": "^5.9.3"
+  },
+  "dependencies": {
+    "date-holidays": "^3.26.8"
+  }
+}
