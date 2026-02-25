@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 
+import { spawnSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -7,6 +8,7 @@ import * as path from "node:path";
 const Holidays = require("date-holidays");
 
 type Action = "save" | "week" | "month" | "all";
+type ExportFormat = "csv" | "tsv";
 
 interface Settings {
   weeklyHours: number;
@@ -29,8 +31,30 @@ interface ParsedArgs {
   saveValues?: number[];
   dateArg?: string;
   offset?: number;
+  exportOptions?: ExportOptions;
   help: boolean;
   errors: string[];
+}
+
+interface ExportOptions {
+  enabled: boolean;
+  format: ExportFormat;
+  zeroEmpty: boolean;
+  skipEmpty: boolean;
+  skipNonWorkdays: boolean;
+  skipHolidays: boolean;
+  zeroHolidays: boolean;
+}
+
+interface PeriodContext {
+  start: Date;
+  end: Date;
+  rows: RowInfo[];
+  baselineDaily: number;
+  loggedTotal: number;
+  periodTarget: number;
+  daysLeft: number;
+  dynamicExpected: number;
 }
 
 interface RowInfo {
@@ -195,6 +219,16 @@ function parseArgs(argv: string[]): ParsedArgs {
   };
 
   let saveRaw: string | undefined;
+  const exportOptions: ExportOptions = {
+    enabled: false,
+    format: "tsv",
+    zeroEmpty: false,
+    skipEmpty: false,
+    skipNonWorkdays: false,
+    skipHolidays: false,
+    zeroHolidays: false,
+  };
+  let usedExportModifier = false;
 
   for (let i = 0; i < argv.length; i += 1) {
     const token = argv[i];
@@ -318,6 +352,51 @@ function parseArgs(argv: string[]): ParsedArgs {
         break;
       }
 
+      case "-x": {
+        exportOptions.enabled = true;
+        const maybeFormat = argv[i + 1];
+        if (maybeFormat !== undefined && !maybeFormat.startsWith("-")) {
+          const format = parseExportFormat(maybeFormat);
+          if (!format) {
+            errors.push(`${token} expects optional format "csv" or "tsv".`);
+          } else {
+            exportOptions.format = format;
+          }
+          i += 1;
+        }
+        break;
+      }
+
+      case "-zero-empty":
+      case "-ze":
+        usedExportModifier = true;
+        exportOptions.zeroEmpty = true;
+        break;
+
+      case "-skip-empty":
+      case "-se":
+        usedExportModifier = true;
+        exportOptions.skipEmpty = true;
+        break;
+
+      case "-skip-nonworkdays":
+      case "-sn":
+        usedExportModifier = true;
+        exportOptions.skipNonWorkdays = true;
+        break;
+
+      case "-skip-holidays":
+      case "-sh":
+        usedExportModifier = true;
+        exportOptions.skipHolidays = true;
+        break;
+
+      case "-zero-holidays":
+      case "-zh":
+        usedExportModifier = true;
+        exportOptions.zeroHolidays = true;
+        break;
+
       case "--help":
       case "-help":
       case "-?":
@@ -356,6 +435,21 @@ function parseArgs(argv: string[]): ParsedArgs {
     (parsed.dateArg !== undefined || parsed.offset !== undefined)
   ) {
     errors.push("-a/-all does not use -d/-date or -o/-offset.");
+  }
+
+  const usedExportFlags = exportOptions.enabled || usedExportModifier;
+  if (usedExportModifier && !exportOptions.enabled) {
+    errors.push("Export modifiers require -x.");
+  }
+  if (
+    usedExportFlags &&
+    parsed.action !== "week" &&
+    parsed.action !== "month"
+  ) {
+    errors.push("Export flags can only be used with -w/-m.");
+  }
+  if (exportOptions.enabled) {
+    parsed.exportOptions = exportOptions;
   }
 
   return parsed;
@@ -399,6 +493,14 @@ function parseSaveValues(raw: string): number[] | null {
   return values;
 }
 
+function parseExportFormat(raw: string): ExportFormat | null {
+  const normalized = raw.trim().toLowerCase();
+  if (normalized === "csv" || normalized === "tsv") {
+    return normalized;
+  }
+  return null;
+}
+
 function printUsage(): void {
   console.log("Usage");
   console.log("  Configuration: trak -h <hours> -l <locale> -ww <workweek>");
@@ -407,6 +509,13 @@ function printUsage(): void {
   );
   console.log("  Reporting:     trak -w [-d <week|date>] [-o <offset>]");
   console.log("                 trak -m [-d <month|date>] [-o <offset>]");
+  console.log(
+    "  Export:        trak -w|-m -x [csv|tsv] [flags] [-d <date>] [-o <offset>]",
+  );
+  console.log("                 format default: tsv");
+  console.log(
+    "                 flags: -zero-empty|-ze -skip-empty|-se -skip-nonworkdays|-sn -skip-holidays|-sh -zero-holidays|-zh",
+  );
   console.log("                 trak -a");
   console.log("");
   console.log("Date formats");
@@ -452,6 +561,15 @@ function printUsage(): void {
   );
   console.log(
     "  trak -m -d February                    # show February report (current year)",
+  );
+  console.log(
+    "  trak -w -x                             # export current week as TSV and copy",
+  );
+  console.log(
+    "  trak -m -x csv -ze                     # export month as CSV, zeros for empty days",
+  );
+  console.log(
+    "  trak -m -x tsv -sh -zh                # skip blocking holidays (skip wins over zero)",
   );
   console.log(
     "  trak -a                                # show all logged entries",
@@ -906,62 +1024,23 @@ function runReport(
   parsed: ParsedArgs,
   settings: Settings,
 ): void {
-  const offset = parsed.offset ?? 0;
-  const anchor =
-    action === "week"
-      ? resolveWeekAnchor(parsed.dateArg, offset)
-      : resolveMonthAnchor(parsed.dateArg, offset);
-
-  const start =
-    action === "week" ? getIsoWeekStart(anchor) : firstDayOfMonth(anchor);
-  const end = action === "week" ? addDays(start, 6) : lastDayOfMonth(anchor);
-  const holidayEngine = createHolidayEngine(settings);
-  const entries = readEntriesInRange(start, end);
-
-  const baselineDaily = settings.weeklyHours / settings.workdaysPerWeek;
-  const rows: RowInfo[] = [];
-
-  let loggedTotal = 0;
-  let periodTarget = 0;
-
-  for (let cursor = start; cursor <= end; cursor = addDays(cursor, 1)) {
-    const date = stripTime(cursor);
-    const iso = formatIsoDate(date);
-    const holiday = getHolidayInfo(holidayEngine, date);
-    const workday = isWorkday(date.getDay(), settings);
-    const loggedHours = entries.get(iso);
-
-    const holidayLabel = holiday.isHoliday
-      ? ` (${holiday.name ?? "Holiday"})`
-      : "";
-    const label = `${WEEKDAY_SHORT[date.getDay()]} ${iso}${holidayLabel}`;
-
-    rows.push({
-      date,
-      iso,
-      label,
-      isWorkday: workday,
-      isHoliday: holiday.isHoliday,
-      holidayName: holiday.name,
-      holidayType: holiday.type,
-      isOptionalHoliday: holiday.isOptionalHoliday,
-      hasBlockingHoliday: holiday.hasBlockingHoliday,
-      loggedHours,
-    });
-
-    if (loggedHours !== undefined) {
-      loggedTotal += loggedHours;
-    }
-    if (workday) {
-      periodTarget += baselineDaily;
-    }
+  const context = buildPeriodContext(action, parsed, settings);
+  if (parsed.exportOptions?.enabled) {
+    runExport(parsed.exportOptions, context.rows, context.baselineDaily);
+    return;
   }
 
+  const {
+    start,
+    end,
+    rows,
+    baselineDaily,
+    loggedTotal,
+    periodTarget,
+    daysLeft,
+    dynamicExpected,
+  } = context;
   const hoursLeft = periodTarget - loggedTotal;
-  const daysLeft = rows.filter(
-    (row) => row.loggedHours === undefined && row.isWorkday,
-  ).length;
-  const dynamicExpected = daysLeft > 0 ? hoursLeft / daysLeft : 0;
 
   const title =
     action === "week"
@@ -1028,6 +1107,198 @@ function runReport(
       ),
     );
   }
+}
+
+function buildPeriodContext(
+  action: "week" | "month",
+  parsed: ParsedArgs,
+  settings: Settings,
+): PeriodContext {
+  const offset = parsed.offset ?? 0;
+  const anchor =
+    action === "week"
+      ? resolveWeekAnchor(parsed.dateArg, offset)
+      : resolveMonthAnchor(parsed.dateArg, offset);
+
+  const start =
+    action === "week" ? getIsoWeekStart(anchor) : firstDayOfMonth(anchor);
+  const end = action === "week" ? addDays(start, 6) : lastDayOfMonth(anchor);
+  const holidayEngine = createHolidayEngine(settings);
+  const entries = readEntriesInRange(start, end);
+
+  const baselineDaily = settings.weeklyHours / settings.workdaysPerWeek;
+  const rows: RowInfo[] = [];
+
+  let loggedTotal = 0;
+  let periodTarget = 0;
+
+  for (let cursor = start; cursor <= end; cursor = addDays(cursor, 1)) {
+    const date = stripTime(cursor);
+    const iso = formatIsoDate(date);
+    const holiday = getHolidayInfo(holidayEngine, date);
+    const workday = isWorkday(date.getDay(), settings);
+    const loggedHours = entries.get(iso);
+
+    const holidayLabel = holiday.isHoliday
+      ? ` (${holiday.name ?? "Holiday"})`
+      : "";
+    const label = `${WEEKDAY_SHORT[date.getDay()]} ${iso}${holidayLabel}`;
+
+    rows.push({
+      date,
+      iso,
+      label,
+      isWorkday: workday,
+      isHoliday: holiday.isHoliday,
+      holidayName: holiday.name,
+      holidayType: holiday.type,
+      isOptionalHoliday: holiday.isOptionalHoliday,
+      hasBlockingHoliday: holiday.hasBlockingHoliday,
+      loggedHours,
+    });
+
+    if (loggedHours !== undefined) {
+      loggedTotal += loggedHours;
+    }
+    if (workday) {
+      periodTarget += baselineDaily;
+    }
+  }
+
+  const hoursLeft = periodTarget - loggedTotal;
+  const daysLeft = rows.filter(
+    (row) => row.loggedHours === undefined && row.isWorkday,
+  ).length;
+  const dynamicExpected = daysLeft > 0 ? hoursLeft / daysLeft : 0;
+
+  return {
+    start,
+    end,
+    rows,
+    baselineDaily,
+    loggedTotal,
+    periodTarget,
+    daysLeft,
+    dynamicExpected,
+  };
+}
+
+function runExport(
+  options: ExportOptions,
+  rows: RowInfo[],
+  baselineDaily: number,
+): void {
+  const valuesLine = renderExportValues(rows, options, baselineDaily);
+  const copied = tryCopyToClipboard(valuesLine);
+  if (copied.success) {
+    const viaSuffix = copied.method ? ` via ${copied.method}` : "";
+    console.log(
+      `Copied ${options.format.toUpperCase()} export to clipboard${viaSuffix}.`,
+    );
+  } else {
+    console.log(
+      warningText("Could not copy to clipboard. Export values are printed below."),
+    );
+  }
+  console.log(valuesLine);
+}
+
+function renderExportValues(
+  rows: RowInfo[],
+  options: ExportOptions,
+  baselineDaily: number,
+): string {
+  const values: string[] = [];
+  const delimiter = options.format === "csv" ? "," : "\t";
+
+  for (const row of rows) {
+    const value = renderExportValue(row, options, baselineDaily);
+    if (value !== undefined) {
+      values.push(value);
+    }
+  }
+
+  return values.join(delimiter);
+}
+
+function renderExportValue(
+  row: RowInfo,
+  options: ExportOptions,
+  baselineDaily: number,
+): string | undefined {
+  if (row.loggedHours !== undefined) {
+    return formatHours(row.loggedHours);
+  }
+
+  if (!row.isWorkday) {
+    if (options.skipNonWorkdays) {
+      return undefined;
+    }
+    return renderEmptyExportValue(options);
+  }
+
+  if (row.hasBlockingHoliday) {
+    if (options.skipHolidays) {
+      return undefined;
+    }
+    if (options.zeroHolidays) {
+      return "0";
+    }
+    return formatHours(baselineDaily);
+  }
+
+  return renderEmptyExportValue(options);
+}
+
+function renderEmptyExportValue(options: ExportOptions): string | undefined {
+  if (options.skipEmpty) {
+    return undefined;
+  }
+  if (options.zeroEmpty) {
+    return "0";
+  }
+  return "";
+}
+
+function tryCopyToClipboard(
+  value: string,
+): { success: boolean; method?: string } {
+  if (process.platform === "darwin") {
+    return runClipboardCommand("pbcopy", [], value, "pbcopy");
+  }
+  if (process.platform === "win32") {
+    return runClipboardCommand("cmd", ["/c", "clip"], value, "clip");
+  }
+  if (process.platform === "linux") {
+    const attempts = [
+      runClipboardCommand("wl-copy", [], value, "wl-copy"),
+      runClipboardCommand(
+        "xclip",
+        ["-selection", "clipboard"],
+        value,
+        "xclip",
+      ),
+      runClipboardCommand("xsel", ["--clipboard", "--input"], value, "xsel"),
+    ];
+    return attempts.find((attempt) => attempt.success) ?? { success: false };
+  }
+  return { success: false };
+}
+
+function runClipboardCommand(
+  command: string,
+  args: string[],
+  value: string,
+  method: string,
+): { success: boolean; method?: string } {
+  const result = spawnSync(command, args, {
+    input: value,
+    encoding: "utf8",
+  });
+  if (result.error || result.status !== 0) {
+    return { success: false };
+  }
+  return { success: true, method };
 }
 
 function runAll(settings: Settings): void {

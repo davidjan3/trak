@@ -28,6 +28,9 @@ Configuration: trak -h <hours> -l <locale> -ww <workweek>
 Logging:       trak -s <hours|h1,h2,...> [-d <date>] [-o <offset>]
 Reporting:     trak -w [-d <week|date>] [-o <offset>]
                trak -m [-d <month|date>] [-o <offset>]
+Export:        trak -w|-m -x [csv|tsv] [flags] [-d <date>] [-o <offset>]
+               format default: tsv
+               flags: -zero-empty|-ze -skip-empty|-se -skip-nonworkdays|-sn -skip-holidays|-sh -zero-holidays|-zh
                trak -a
 ```
 
@@ -47,6 +50,10 @@ trak -w -d 02/25                       # show week containing Feb 25 (current ye
 trak -w -d 8                           # show ISO week 8 (current year)
 trak -m -d February                    # show February report (current year)
 trak -m -d 02/25                       # show month containing Feb 25 (current year, US format)
+trak -w -x                             # export current week as TSV and copy to clipboard
+trak -m -x csv -ze                     # export month as CSV, zeros for empty days
+trak -m -x tsv -sn -sh                 # skip empty non-workdays and blocking holidays
+trak -m -x tsv -zh                     # export blocking holidays as 0 instead of baseline
 trak -a                                # show all logged entries
 ```
 
