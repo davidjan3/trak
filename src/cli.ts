@@ -7,7 +7,7 @@ import * as path from "node:path";
 
 const Holidays = require("date-holidays");
 
-type Action = "save" | "week" | "month" | "all";
+type Action = "save" | "week" | "month" | "all" | "exportAll";
 type ExportFormat = "csv" | "tsv";
 
 interface Settings {
@@ -29,6 +29,7 @@ interface ParsedArgs {
   settingsPatch: SettingsPatch;
   action?: Action;
   saveValues?: number[];
+  tagFilters?: string[];
   dateArg?: string;
   offset?: number;
   exportOptions?: ExportOptions;
@@ -44,6 +45,7 @@ interface ExportOptions {
   skipNonWorkdays: boolean;
   skipHolidays: boolean;
   zeroHolidays: boolean;
+  decimalComma: boolean;
 }
 
 interface PeriodContext {
@@ -55,6 +57,7 @@ interface PeriodContext {
   periodTarget: number;
   daysLeft: number;
   dynamicExpected: number;
+  tagTotals: Map<string, number>;
 }
 
 interface RowInfo {
@@ -67,7 +70,17 @@ interface RowInfo {
   holidayType?: string;
   isOptionalHoliday: boolean;
   hasBlockingHoliday: boolean;
+  tags: string[];
   loggedHours?: number;
+}
+
+interface EntryRecord {
+  hours: number;
+  tags: string[];
+}
+
+interface AllEntryRecord extends EntryRecord {
+  iso: string;
 }
 
 const BASE_DIR = path.join(os.homedir(), ".trak");
@@ -200,7 +213,10 @@ function main(): void {
         runReport("month", parsed, settings);
         break;
       case "all":
-        runAll(settings);
+        runAll(parsed, settings);
+        break;
+      case "exportAll":
+        runExportAll(parsed, settings);
         break;
     }
   } catch (error) {
@@ -219,6 +235,8 @@ function parseArgs(argv: string[]): ParsedArgs {
   };
 
   let saveRaw: string | undefined;
+  let tagRaw: string | undefined;
+  let usedTagFlag = false;
   const exportOptions: ExportOptions = {
     enabled: false,
     format: "tsv",
@@ -227,6 +245,7 @@ function parseArgs(argv: string[]): ParsedArgs {
     skipNonWorkdays: false,
     skipHolidays: false,
     zeroHolidays: false,
+    decimalComma: false,
   };
   let usedExportModifier = false;
 
@@ -326,6 +345,17 @@ function parseArgs(argv: string[]): ParsedArgs {
         break;
       }
 
+      case "-tag":
+      case "-t": {
+        usedTagFlag = true;
+        const maybeValue = argv[i + 1];
+        if (maybeValue !== undefined && !maybeValue.startsWith("-")) {
+          tagRaw = maybeValue;
+          i += 1;
+        }
+        break;
+      }
+
       case "-d":
       case "-date": {
         const value = readFlagValue(argv, token, i, errors);
@@ -397,6 +427,12 @@ function parseArgs(argv: string[]): ParsedArgs {
         exportOptions.zeroHolidays = true;
         break;
 
+      case "-decimal-comma":
+      case "-dc":
+        usedExportModifier = true;
+        exportOptions.decimalComma = true;
+        break;
+
       case "--help":
       case "-help":
       case "-?":
@@ -424,6 +460,24 @@ function parseArgs(argv: string[]): ParsedArgs {
     }
   }
 
+  if (usedTagFlag && tagRaw === undefined) {
+    parsed.tagFilters = [];
+  } else if (tagRaw !== undefined) {
+    const tags = parseTags(tagRaw);
+    if (!tags) {
+      errors.push("-t/-tag expects non-empty comma-separated tags.");
+    } else {
+      parsed.tagFilters = tags;
+    }
+  }
+
+  if (exportOptions.enabled) {
+    parsed.exportOptions = exportOptions;
+    if (!parsed.action || parsed.action === "all") {
+      parsed.action = "exportAll";
+    }
+  }
+
   if (
     !parsed.action &&
     (parsed.dateArg !== undefined || parsed.offset !== undefined)
@@ -436,6 +490,12 @@ function parseArgs(argv: string[]): ParsedArgs {
   ) {
     errors.push("-a/-all does not use -d/-date or -o/-offset.");
   }
+  if (
+    parsed.action === "exportAll" &&
+    (parsed.dateArg !== undefined || parsed.offset !== undefined)
+  ) {
+    errors.push("-x export-all does not use -d/-date or -o/-offset.");
+  }
 
   const usedExportFlags = exportOptions.enabled || usedExportModifier;
   if (usedExportModifier && !exportOptions.enabled) {
@@ -444,12 +504,20 @@ function parseArgs(argv: string[]): ParsedArgs {
   if (
     usedExportFlags &&
     parsed.action !== "week" &&
-    parsed.action !== "month"
+    parsed.action !== "month" &&
+    parsed.action !== "exportAll"
   ) {
-    errors.push("Export flags can only be used with -w/-m.");
+    errors.push("Export flags can only be used with -w/-m/-x.");
   }
-  if (exportOptions.enabled) {
-    parsed.exportOptions = exportOptions;
+  if (
+    parsed.tagFilters &&
+    parsed.action !== "save" &&
+    parsed.action !== "week" &&
+    parsed.action !== "month" &&
+    parsed.action !== "all" &&
+    parsed.action !== "exportAll"
+  ) {
+    errors.push("-t/-tag can only be used with -s/-w/-m/-a/-x.");
   }
 
   return parsed;
@@ -493,6 +561,29 @@ function parseSaveValues(raw: string): number[] | null {
   return values;
 }
 
+function parseTags(raw: string): string[] | null {
+  const parts = raw.split(",");
+  if (parts.length === 0) {
+    return null;
+  }
+
+  const seen = new Set<string>();
+  const tags: string[] = [];
+
+  for (const part of parts) {
+    const normalized = part.trim().toLowerCase();
+    if (normalized.length === 0 || normalized.includes("|")) {
+      return null;
+    }
+    if (!seen.has(normalized)) {
+      seen.add(normalized);
+      tags.push(normalized);
+    }
+  }
+
+  return tags.length > 0 ? tags : null;
+}
+
 function parseExportFormat(raw: string): ExportFormat | null {
   const normalized = raw.trim().toLowerCase();
   if (normalized === "csv" || normalized === "tsv") {
@@ -505,18 +596,25 @@ function printUsage(): void {
   console.log("Usage");
   console.log("  Configuration: trak -h <hours> -l <locale> -ww <workweek>");
   console.log(
-    "  Logging:       trak -s <hours|h1,h2,...> [-d <date>] [-o <offset>]",
+    "  Logging:       trak -s <hours|h1,h2,...> [-t [tag|t1,t2,...]] [-d <date>] [-o <offset>]",
   );
-  console.log("  Reporting:     trak -w [-d <week|date>] [-o <offset>]");
-  console.log("                 trak -m [-d <month|date>] [-o <offset>]");
   console.log(
-    "  Export:        trak -w|-m -x [csv|tsv] [flags] [-d <date>] [-o <offset>]",
+    "  Reporting:     trak -w [-t [tag|t1,t2,...]] [-d <week|date>] [-o <offset>]",
+  );
+  console.log(
+    "                 trak -m [-t [tag|t1,t2,...]] [-d <month|date>] [-o <offset>]",
+  );
+  console.log(
+    "  Export:        trak -w|-m -x [csv|tsv] [flags] [-t [tag|t1,t2,...]] [-d <date>] [-o <offset>]",
+  );
+  console.log(
+    "                 trak -x [csv|tsv] [flags] [-t [tag|t1,t2,...]]",
   );
   console.log("                 format default: tsv");
   console.log(
-    "                 flags: -zero-empty|-ze -skip-empty|-se -skip-nonworkdays|-sn -skip-holidays|-sh -zero-holidays|-zh",
+    "                 flags: -zero-empty|-ze -skip-empty|-se -skip-nonworkdays|-sn -skip-holidays|-sh -zero-holidays|-zh -decimal-comma|-dc",
   );
-  console.log("                 trak -a");
+  console.log("  All:           trak -a [-t [tag|t1,t2,...]]");
   console.log("");
   console.log("Date formats");
   console.log("  Save: YYYY-MM-DD | DD.MM.YYYY | DD.MM. | MM/DD/YYYY | MM/DD");
@@ -536,6 +634,12 @@ function printUsage(): void {
     "  trak -s 8 -d 25.02.                    # log 8h on 25 Feb (current year)",
   );
   console.log(
+    "  trak -s 8 -t client                    # log 8h for today tagged \"client\"",
+  );
+  console.log(
+    "  trak -s 8 -t                           # clear tags for selected save target(s)",
+  );
+  console.log(
     "  trak -s 8 -d 02/25                     # log 8h on Feb 25 (current year, US format)",
   );
   console.log(
@@ -548,7 +652,13 @@ function printUsage(): void {
     "  trak -s 8,7.5,6 -d 2026-12-24          # log across next valid workdays",
   );
   console.log(
+    "  trak -s 8,7.5 -t client,meeting        # apply both tags to every saved entry",
+  );
+  console.log(
     "  trak -w                                # show current week report",
+  );
+  console.log(
+    "  trak -w -t client,meeting              # filter week report by tags (OR)",
   );
   console.log(
     "  trak -w -o -1                          # show previous week report",
@@ -563,7 +673,16 @@ function printUsage(): void {
     "  trak -m -d February                    # show February report (current year)",
   );
   console.log(
+    "  trak -m -t client                      # show month report filtered by tag",
+  );
+  console.log(
     "  trak -w -x                             # export current week as TSV and copy",
+  );
+  console.log(
+    "  trak -x                                # export all entries (first..last day)",
+  );
+  console.log(
+    "  trak -x -t client                      # export all entries filtered by tag",
   );
   console.log(
     "  trak -m -x csv -ze                     # export month as CSV, zeros for empty days",
@@ -572,7 +691,13 @@ function printUsage(): void {
     "  trak -m -x tsv -sh -zh                # skip blocking holidays (skip wins over zero)",
   );
   console.log(
+    "  trak -w -x tsv -dc                     # export with decimal commas",
+  );
+  console.log(
     "  trak -a                                # show all logged entries",
+  );
+  console.log(
+    "  trak -a -t client,meeting              # show all entries filtered by tags (OR)",
   );
 }
 
@@ -932,6 +1057,7 @@ function runSave(parsed: ParsedArgs, settings: Settings): void {
   }
 
   const offset = parsed.offset ?? 0;
+  const saveTags = parsed.tagFilters;
   const anchor = resolveSaveAnchor(parsed.dateArg, offset);
   const holidayEngine = createHolidayEngine(settings);
 
@@ -958,7 +1084,7 @@ function runSave(parsed: ParsedArgs, settings: Settings): void {
       );
     }
 
-    applySaveValue(target, value);
+    applySaveValue(target, value, saveTags);
     return;
   }
 
@@ -980,25 +1106,29 @@ function runSave(parsed: ParsedArgs, settings: Settings): void {
       }
     }
 
-    applySaveValue(cursor, hours);
+    applySaveValue(cursor, hours, saveTags);
     cursor = addDays(cursor, 1);
   }
 }
 
-function applySaveValue(date: Date, value: number): void {
+function applySaveValue(
+  date: Date,
+  value: number,
+  tags: string[] | undefined,
+): void {
   if (value === 0) {
     const oldValue = clearEntry(date);
     printClearResult(date, oldValue);
     return;
   }
-  const oldValue = writeEntry(date, value);
+  const oldValue = writeEntry(date, value, tags);
   printWriteResult(date, value, oldValue);
 }
 
 function printWriteResult(
   date: Date,
   newValue: number,
-  oldValue: number | undefined,
+  oldValue: EntryRecord | undefined,
 ): void {
   const iso = formatIsoDate(date);
   if (oldValue === undefined) {
@@ -1006,17 +1136,17 @@ function printWriteResult(
     return;
   }
   console.log(
-    `Updated ${iso}: ${formatHours(oldValue)}h -> ${formatHours(newValue)}h.`,
+    `Updated ${iso}: ${formatHours(oldValue.hours)}h -> ${formatHours(newValue)}h.`,
   );
 }
 
-function printClearResult(date: Date, oldValue: number | undefined): void {
+function printClearResult(date: Date, oldValue: EntryRecord | undefined): void {
   const iso = formatIsoDate(date);
   if (oldValue === undefined) {
     console.log(`No entry to clear on ${iso}.`);
     return;
   }
-  console.log(`Cleared ${formatHours(oldValue)}h entry on ${iso}.`);
+  console.log(`Cleared ${formatHours(oldValue.hours)}h entry on ${iso}.`);
 }
 
 function runReport(
@@ -1039,6 +1169,7 @@ function runReport(
     periodTarget,
     daysLeft,
     dynamicExpected,
+    tagTotals,
   } = context;
   const hoursLeft = periodTarget - loggedTotal;
 
@@ -1053,29 +1184,40 @@ function runReport(
     "Day".length,
     ...rows.map((row) => row.label.length),
   );
-
-  console.log(`${"Day".padEnd(dayWidth)}  Hours`);
-  console.log(`${"-".repeat(dayWidth)}  -----`);
-
-  for (const row of rows) {
-    let value: number;
-    let expected = false;
-
+  const hoursByRow = rows.map((row) => {
     if (row.loggedHours !== undefined) {
-      value = row.loggedHours;
-    } else {
-      expected = true;
-      if (!row.isWorkday) {
-        value = 0;
-      } else if (row.hasBlockingHoliday) {
-        value = baselineDaily;
-      } else {
-        value = dynamicExpected;
-      }
+      return formatHours(row.loggedHours);
     }
+    if (!row.isWorkday) {
+      return "0";
+    }
+    if (row.hasBlockingHoliday) {
+      return formatHours(baselineDaily);
+    }
+    return formatHours(dynamicExpected);
+  });
+  const expectedByRow = rows.map((row) => row.loggedHours === undefined);
+  const hoursWidth = Math.max(
+    "Hours".length,
+    ...hoursByRow.map((value) => value.length),
+  );
+  const tagsByRow = rows.map((row) => row.tags.join(","));
+  const tagsWidth = Math.max(
+    "Tags".length,
+    ...tagsByRow.map((value) => value.length),
+  );
 
-    const valueText = formatHours(value);
+  console.log(
+    `${"Day".padEnd(dayWidth)}  ${"Hours".padEnd(hoursWidth)}  ${"Tags".padEnd(tagsWidth)}`,
+  );
+  console.log(
+    `${"-".repeat(dayWidth)}  ${"-".repeat(hoursWidth)}  ${"-".repeat(tagsWidth)}`,
+  );
+
+  for (let i = 0; i < rows.length; i += 1) {
+    const row = rows[i];
     const paddedLabel = row.label.padEnd(dayWidth);
+    const valueText = hoursByRow[i].padEnd(hoursWidth);
 
     const rowColor = getRowColor(row);
     const holidayNameColor = getHolidayNameColor(row);
@@ -1087,15 +1229,17 @@ function runReport(
     );
     const renderedValue = rowColor
       ? colorText(valueText, rowColor)
-      : expected
+      : expectedByRow[i]
         ? grayText(valueText)
         : valueText;
+    const tagsText = tagsByRow[i].padEnd(tagsWidth);
 
-    console.log(`${renderedLabel}  ${renderedValue}`);
+    console.log(`${renderedLabel}  ${renderedValue}  ${tagsText}`);
   }
 
   console.log("");
   console.log(`Total logged: ${formatHours(loggedTotal)}`);
+  printLoggedOnTagLines(tagTotals);
   console.log(`Hours left: ${formatHours(hoursLeft)}`);
   console.log(
     `Expected/day (remaining): ${daysLeft > 0 ? formatHours(dynamicExpected) : "n/a"}`,
@@ -1107,6 +1251,16 @@ function runReport(
       ),
     );
   }
+}
+
+function runExportAll(parsed: ParsedArgs, settings: Settings): void {
+  if (!parsed.exportOptions?.enabled) {
+    throw new Error("Export options are required for -x export-all.");
+  }
+
+  const rows = buildExportAllRows(parsed, settings);
+  const baselineDaily = settings.weeklyHours / settings.workdaysPerWeek;
+  runExport(parsed.exportOptions, rows, baselineDaily);
 }
 
 function buildPeriodContext(
@@ -1128,6 +1282,7 @@ function buildPeriodContext(
 
   const baselineDaily = settings.weeklyHours / settings.workdaysPerWeek;
   const rows: RowInfo[] = [];
+  const tagTotals = new Map<string, number>();
 
   let loggedTotal = 0;
   let periodTarget = 0;
@@ -1137,7 +1292,12 @@ function buildPeriodContext(
     const iso = formatIsoDate(date);
     const holiday = getHolidayInfo(holidayEngine, date);
     const workday = isWorkday(date.getDay(), settings);
-    const loggedHours = entries.get(iso);
+    const entry = entries.get(iso);
+    const matchesTagFilter = entry
+      ? entryMatchesTagFilter(entry, parsed.tagFilters)
+      : false;
+    const loggedHours = matchesTagFilter ? entry?.hours : undefined;
+    const tags = matchesTagFilter && entry ? [...entry.tags] : [];
 
     const holidayLabel = holiday.isHoliday
       ? ` (${holiday.name ?? "Holiday"})`
@@ -1154,11 +1314,13 @@ function buildPeriodContext(
       holidayType: holiday.type,
       isOptionalHoliday: holiday.isOptionalHoliday,
       hasBlockingHoliday: holiday.hasBlockingHoliday,
+      tags,
       loggedHours,
     });
 
-    if (loggedHours !== undefined) {
+    if (entry && matchesTagFilter && loggedHours !== undefined) {
       loggedTotal += loggedHours;
+      addEntryTagsToTotals(tagTotals, entry);
     }
     if (workday) {
       periodTarget += baselineDaily;
@@ -1180,7 +1342,59 @@ function buildPeriodContext(
     periodTarget,
     daysLeft,
     dynamicExpected,
+    tagTotals,
   };
+}
+
+function buildExportAllRows(parsed: ParsedArgs, settings: Settings): RowInfo[] {
+  const allEntries = readAllEntries().filter((entry) =>
+    entryMatchesTagFilter(entry, parsed.tagFilters),
+  );
+  if (allEntries.length === 0) {
+    return [];
+  }
+
+  const firstDate = parseIsoDate(allEntries[0].iso);
+  const lastDate = parseIsoDate(allEntries[allEntries.length - 1].iso);
+  if (!firstDate || !lastDate) {
+    return [];
+  }
+
+  const holidayEngine = createHolidayEngine(settings);
+  const byIso = new Map<string, AllEntryRecord>();
+  for (const entry of allEntries) {
+    byIso.set(entry.iso, entry);
+  }
+
+  const rows: RowInfo[] = [];
+  for (let cursor = firstDate; cursor <= lastDate; cursor = addDays(cursor, 1)) {
+    const date = stripTime(cursor);
+    const iso = formatIsoDate(date);
+    const holiday = getHolidayInfo(holidayEngine, date);
+    const workday = isWorkday(date.getDay(), settings);
+    const entry = byIso.get(iso);
+
+    const holidayLabel = holiday.isHoliday
+      ? ` (${holiday.name ?? "Holiday"})`
+      : "";
+    const label = `${WEEKDAY_SHORT[date.getDay()]} ${iso}${holidayLabel}`;
+
+    rows.push({
+      date,
+      iso,
+      label,
+      isWorkday: workday,
+      isHoliday: holiday.isHoliday,
+      holidayName: holiday.name,
+      holidayType: holiday.type,
+      isOptionalHoliday: holiday.isOptionalHoliday,
+      hasBlockingHoliday: holiday.hasBlockingHoliday,
+      tags: entry ? [...entry.tags] : [],
+      loggedHours: entry?.hours,
+    });
+  }
+
+  return rows;
 }
 
 function runExport(
@@ -1214,7 +1428,7 @@ function renderExportValues(
   for (const row of rows) {
     const value = renderExportValue(row, options, baselineDaily);
     if (value !== undefined) {
-      values.push(value);
+      values.push(escapeExportValue(value, options));
     }
   }
 
@@ -1227,7 +1441,7 @@ function renderExportValue(
   baselineDaily: number,
 ): string | undefined {
   if (row.loggedHours !== undefined) {
-    return formatHours(row.loggedHours);
+    return formatExportHours(row.loggedHours, options);
   }
 
   if (!row.isWorkday) {
@@ -1244,7 +1458,7 @@ function renderExportValue(
     if (options.zeroHolidays) {
       return "0";
     }
-    return formatHours(baselineDaily);
+    return formatExportHours(baselineDaily, options);
   }
 
   return renderEmptyExportValue(options);
@@ -1258,6 +1472,21 @@ function renderEmptyExportValue(options: ExportOptions): string | undefined {
     return "0";
   }
   return "";
+}
+
+function formatExportHours(hours: number, options: ExportOptions): string {
+  const formatted = formatHours(hours);
+  if (!options.decimalComma) {
+    return formatted;
+  }
+  return formatted.replace(".", ",");
+}
+
+function escapeExportValue(value: string, options: ExportOptions): string {
+  if (options.format !== "csv" || !value.includes(",")) {
+    return value;
+  }
+  return `"${value.replace(/"/g, '""')}"`;
 }
 
 function tryCopyToClipboard(
@@ -1301,10 +1530,13 @@ function runClipboardCommand(
   return { success: true, method };
 }
 
-function runAll(settings: Settings): void {
-  const entries = readAllEntries();
+function runAll(parsed: ParsedArgs, settings: Settings): void {
+  const entries = readAllEntries().filter((entry) =>
+    entryMatchesTagFilter(entry, parsed.tagFilters),
+  );
   const holidayEngine = createHolidayEngine(settings);
   const rows: RowInfo[] = [];
+  const tagTotals = new Map<string, number>();
   let totalHours = 0;
 
   for (const entry of entries) {
@@ -1329,9 +1561,11 @@ function runAll(settings: Settings): void {
       holidayType: holiday.type,
       isOptionalHoliday: holiday.isOptionalHoliday,
       hasBlockingHoliday: holiday.hasBlockingHoliday,
+      tags: [...entry.tags],
       loggedHours: entry.hours,
     });
     totalHours += entry.hours;
+    addEntryTagsToTotals(tagTotals, entry);
   }
 
   console.log("All entries");
@@ -1346,11 +1580,26 @@ function runAll(settings: Settings): void {
     "Day".length,
     ...rows.map((row) => row.label.length),
   );
-  console.log(`${"Day".padEnd(dayWidth)}  Hours`);
-  console.log(`${"-".repeat(dayWidth)}  -----`);
+  const hoursByRow = rows.map((row) => formatHours(row.loggedHours ?? 0));
+  const hoursWidth = Math.max(
+    "Hours".length,
+    ...hoursByRow.map((value) => value.length),
+  );
+  const tagsByRow = rows.map((row) => row.tags.join(","));
+  const tagsWidth = Math.max(
+    "Tags".length,
+    ...tagsByRow.map((value) => value.length),
+  );
+  console.log(
+    `${"Day".padEnd(dayWidth)}  ${"Hours".padEnd(hoursWidth)}  ${"Tags".padEnd(tagsWidth)}`,
+  );
+  console.log(
+    `${"-".repeat(dayWidth)}  ${"-".repeat(hoursWidth)}  ${"-".repeat(tagsWidth)}`,
+  );
 
-  for (const row of rows) {
-    const valueText = formatHours(row.loggedHours ?? 0);
+  for (let i = 0; i < rows.length; i += 1) {
+    const row = rows[i];
+    const valueText = hoursByRow[i].padEnd(hoursWidth);
     const paddedLabel = row.label.padEnd(dayWidth);
     const rowColor = getRowColor(row);
     const holidayNameColor = getHolidayNameColor(row);
@@ -1361,11 +1610,47 @@ function runAll(settings: Settings): void {
       holidayNameColor,
     );
     const renderedValue = rowColor ? colorText(valueText, rowColor) : valueText;
-    console.log(`${renderedLabel}  ${renderedValue}`);
+    const tagsText = tagsByRow[i].padEnd(tagsWidth);
+    console.log(`${renderedLabel}  ${renderedValue}  ${tagsText}`);
   }
 
   console.log("");
   console.log(`Total logged: ${formatHours(totalHours)}`);
+  printLoggedOnTagLines(tagTotals);
+}
+
+function entryMatchesTagFilter(
+  entry: EntryRecord,
+  tagFilters: string[] | undefined,
+): boolean {
+  if (!tagFilters || tagFilters.length === 0) {
+    return true;
+  }
+  if (entry.tags.length === 0) {
+    return false;
+  }
+  return tagFilters.some((tag) => entry.tags.includes(tag));
+}
+
+function addEntryTagsToTotals(
+  totals: Map<string, number>,
+  entry: EntryRecord,
+): void {
+  for (const tag of entry.tags) {
+    totals.set(tag, (totals.get(tag) ?? 0) + entry.hours);
+  }
+}
+
+function sortedTagTotals(tagTotals: Map<string, number>): Array<[string, number]> {
+  return Array.from(tagTotals.entries()).sort((a, b) =>
+    a[0].localeCompare(b[0]),
+  );
+}
+
+function printLoggedOnTagLines(tagTotals: Map<string, number>): void {
+  for (const [tag, hours] of sortedTagTotals(tagTotals)) {
+    console.log(`Logged on ${tag}: ${formatHours(hours)}`);
+  }
 }
 
 function resolveSaveAnchor(dateArg: string | undefined, offset: number): Date {
@@ -1574,8 +1859,8 @@ function lastDayOfMonth(date: Date): Date {
   return new Date(date.getFullYear(), date.getMonth() + 1, 0);
 }
 
-function readEntriesInRange(start: Date, end: Date): Map<string, number> {
-  const out = new Map<string, number>();
+function readEntriesInRange(start: Date, end: Date): Map<string, EntryRecord> {
+  const out = new Map<string, EntryRecord>();
   if (!fs.existsSync(DATA_DIR)) {
     return out;
   }
@@ -1592,9 +1877,9 @@ function readEntriesInRange(start: Date, end: Date): Map<string, number> {
   ) {
     const filePath = monthFilePath(cursor);
     const entries = readMonthEntries(filePath);
-    for (const [dateIso, hours] of entries.entries()) {
+    for (const [dateIso, entry] of entries.entries()) {
       if (dateIso >= startIso && dateIso <= endIso) {
-        out.set(dateIso, hours);
+        out.set(dateIso, cloneEntry(entry));
       }
     }
   }
@@ -1602,18 +1887,26 @@ function readEntriesInRange(start: Date, end: Date): Map<string, number> {
   return out;
 }
 
-function writeEntry(date: Date, hours: number): number | undefined {
+function writeEntry(
+  date: Date,
+  hours: number,
+  tags: string[] | undefined,
+): EntryRecord | undefined {
   ensureBaseDirs();
   const filePath = monthFilePath(date);
   const entries = readMonthEntries(filePath);
   const dateIso = formatIsoDate(date);
   const oldValue = entries.get(dateIso);
-  entries.set(dateIso, hours);
+  const nextTags = tags !== undefined ? [...tags] : oldValue ? oldValue.tags : [];
+  entries.set(dateIso, {
+    hours,
+    tags: [...nextTags],
+  });
   writeMonthEntries(filePath, entries);
-  return oldValue;
+  return oldValue ? cloneEntry(oldValue) : undefined;
 }
 
-function clearEntry(date: Date): number | undefined {
+function clearEntry(date: Date): EntryRecord | undefined {
   ensureBaseDirs();
   const filePath = monthFilePath(date);
   if (!fs.existsSync(filePath)) {
@@ -1627,11 +1920,11 @@ function clearEntry(date: Date): number | undefined {
   }
   entries.delete(dateIso);
   writeMonthEntries(filePath, entries);
-  return oldValue;
+  return cloneEntry(oldValue);
 }
 
-function readAllEntries(): Array<{ iso: string; hours: number }> {
-  const out = new Map<string, number>();
+function readAllEntries(): AllEntryRecord[] {
+  const out = new Map<string, EntryRecord>();
   if (!fs.existsSync(DATA_DIR)) {
     return [];
   }
@@ -1644,14 +1937,18 @@ function readAllEntries(): Array<{ iso: string; hours: number }> {
   for (const file of files) {
     const filePath = path.join(DATA_DIR, file);
     const entries = readMonthEntries(filePath);
-    for (const [iso, hours] of entries.entries()) {
-      out.set(iso, hours);
+    for (const [iso, entry] of entries.entries()) {
+      out.set(iso, cloneEntry(entry));
     }
   }
 
   return Array.from(out.entries())
     .sort((a, b) => a[0].localeCompare(b[0]))
-    .map(([iso, hours]) => ({ iso, hours }));
+    .map(([iso, entry]) => ({
+      iso,
+      hours: entry.hours,
+      tags: [...entry.tags],
+    }));
 }
 
 function monthFilePath(date: Date): string {
@@ -1660,8 +1957,8 @@ function monthFilePath(date: Date): string {
   return path.join(DATA_DIR, `${year}_${month}.csv`);
 }
 
-function readMonthEntries(filePath: string): Map<string, number> {
-  const entries = new Map<string, number>();
+function readMonthEntries(filePath: string): Map<string, EntryRecord> {
+  const entries = new Map<string, EntryRecord>();
   if (!fs.existsSync(filePath)) {
     return entries;
   }
@@ -1669,11 +1966,19 @@ function readMonthEntries(filePath: string): Map<string, number> {
   const raw = fs.readFileSync(filePath, "utf8");
   for (const line of raw.split(/\r?\n/)) {
     const trimmed = line.trim();
-    if (!trimmed || trimmed.toLowerCase() === "date,hours") {
+    const normalizedLine = trimmed.toLowerCase();
+    if (
+      !trimmed ||
+      normalizedLine === "date,hours" ||
+      normalizedLine === "date,hours,tags"
+    ) {
       continue;
     }
 
-    const [dateIso, hoursRaw] = trimmed.split(",");
+    const cells = trimmed.split(",");
+    const dateIso = cells[0]?.trim();
+    const hoursRaw = cells[1]?.trim();
+    const tagsRaw = cells.slice(2).join(",").trim();
     if (!dateIso || !hoursRaw) {
       continue;
     }
@@ -1686,7 +1991,10 @@ function readMonthEntries(filePath: string): Map<string, number> {
       continue;
     }
 
-    entries.set(dateIso, hours);
+    entries.set(dateIso, {
+      hours,
+      tags: parseStoredTags(tagsRaw),
+    });
   }
 
   return entries;
@@ -1694,16 +2002,46 @@ function readMonthEntries(filePath: string): Map<string, number> {
 
 function writeMonthEntries(
   filePath: string,
-  entries: Map<string, number>,
+  entries: Map<string, EntryRecord>,
 ): void {
   const rows = Array.from(entries.entries()).sort((a, b) =>
     a[0].localeCompare(b[0]),
   );
   const lines = [
-    "date,hours",
-    ...rows.map(([date, hours]) => `${date},${formatHours(hours)}`),
+    "date,hours,tags",
+    ...rows.map(
+      ([date, entry]) =>
+        `${date},${formatHours(entry.hours)},${entry.tags.join("|")}`,
+    ),
   ];
   fs.writeFileSync(filePath, `${lines.join("\n")}\n`, "utf8");
+}
+
+function parseStoredTags(raw: string): string[] {
+  if (!raw) {
+    return [];
+  }
+
+  const tags: string[] = [];
+  const seen = new Set<string>();
+  for (const part of raw.split("|")) {
+    const normalized = part.trim().toLowerCase();
+    if (normalized.length === 0) {
+      continue;
+    }
+    if (!seen.has(normalized)) {
+      seen.add(normalized);
+      tags.push(normalized);
+    }
+  }
+  return tags;
+}
+
+function cloneEntry(entry: EntryRecord): EntryRecord {
+  return {
+    hours: entry.hours,
+    tags: [...entry.tags],
+  };
 }
 
 function ensureBaseDirs(): void {
