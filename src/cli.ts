@@ -54,7 +54,7 @@ interface PeriodContext {
   rows: RowInfo[];
   baselineDaily: number;
   loggedTotal: number;
-  periodTarget: number;
+  hoursLeft: number;
   daysLeft: number;
   dynamicExpected: number;
   tagTotals: Map<string, number>;
@@ -1166,12 +1166,11 @@ function runReport(
     rows,
     baselineDaily,
     loggedTotal,
-    periodTarget,
     daysLeft,
     dynamicExpected,
     tagTotals,
+    hoursLeft,
   } = context;
-  const hoursLeft = periodTarget - loggedTotal;
 
   const title =
     action === "week"
@@ -1327,9 +1326,16 @@ function buildPeriodContext(
     }
   }
 
-  const hoursLeft = periodTarget - loggedTotal;
+  const creditedTotal = rows.reduce(
+    (total, row) => total + getCreditedHours(row, baselineDaily),
+    0,
+  );
+  const hoursLeft = periodTarget - creditedTotal;
   const daysLeft = rows.filter(
-    (row) => row.loggedHours === undefined && row.isWorkday,
+    (row) =>
+      row.loggedHours === undefined &&
+      row.isWorkday &&
+      !row.hasBlockingHoliday,
   ).length;
   const dynamicExpected = daysLeft > 0 ? hoursLeft / daysLeft : 0;
 
@@ -1339,11 +1345,21 @@ function buildPeriodContext(
     rows,
     baselineDaily,
     loggedTotal,
-    periodTarget,
+    hoursLeft,
     daysLeft,
     dynamicExpected,
     tagTotals,
   };
+}
+
+function getCreditedHours(row: RowInfo, baselineDaily: number): number {
+  if (row.loggedHours !== undefined) {
+    return row.loggedHours;
+  }
+  if (row.isWorkday && row.hasBlockingHoliday) {
+    return baselineDaily;
+  }
+  return 0;
 }
 
 function buildExportAllRows(parsed: ParsedArgs, settings: Settings): RowInfo[] {
