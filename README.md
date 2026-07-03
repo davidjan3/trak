@@ -2,7 +2,9 @@
 
 Minimal TypeScript CLI for local time tracking.
 
-## Install
+## Local install
+
+From this repo, install dependencies, build the CLI, then link it globally:
 
 ```bash
 npm install
@@ -10,10 +12,17 @@ npm run build
 npm install -g .
 ```
 
-Then use:
+After that, use `trak` from anywhere:
 
 ```bash
 trak ...
+```
+
+After local code changes, rerun:
+
+```bash
+npm run build
+npm install -g .
 ```
 
 Data is stored centrally in:
@@ -41,12 +50,13 @@ All:           trak -a [-t [tag|t1,t2,...]]
 trak -h 40 -l de-rp -ww mo-fr          # create or update settings
 trak -s 7.5                            # log 7.5h for today
 trak -s 8 -t client                    # log 8h tagged "client"
-trak -s 8 -t                           # clear tags for selected save target(s)
+trak -s 8 -t                           # log 8h untagged, replacing selected day(s)
 trak -s 8 -d 25.02.                    # log 8h on 25 Feb (current year)
 trak -s 8 -d 02/25                     # log 8h on Feb 25 (current year, US format)
 trak -s 8 -o -1                        # log 8h for yesterday
 trak -s 0 -d 25.02.                    # clear entry on 25 Feb (current year)
 trak -s 8,7.5,6 -d 2026-12-24          # log across next valid workdays
+trak -t ai -d 01.07. -s 3,2,6          # log tagged hours across workdays
 trak -s 8,7.5 -t client,meeting        # apply both tags to each saved entry
 trak -w                                # show current week report
 trak -w -t client,meeting              # filter week report by tags (OR)
@@ -71,9 +81,13 @@ trak -a -t client,meeting              # show all entries filtered by tags
 ## Tag behavior
 
 - Tags are normalized to lowercase on save.
-- Using `-t` without a value clears tags on the selected save entry/entries.
-- Multiple tags in `-t` are comma-separated.
+- Tagged saves coexist with other tagged entries on the same day.
+- Untagged saves replace all entries on the selected day; `-s 0` without tags clears the day.
+- `-s 0 -t <tag>` clears matching tagged entries and leaves other tags intact.
+- Multiple tags in `-t` are comma-separated and belong to the same saved entry.
 - Filtering by multiple tags uses OR matching.
+- Reports show multiple same-day entries as comma-separated hours and tags in matching order.
+- Exports without a tag filter sum same-day entries; exports with `-t` include only matching entries.
 - Per-tag `Logged on <tag>:` lines count full entry hours for each tag.
 
 ## Standalone export behavior

@@ -8,6 +8,7 @@
   },
   "scripts": {
     "build": "tsc",
+    "test": "npm run build && jest --runInBand",
     "trak": "node dist/cli.js",
     "prepare": "npm run build"
   },
@@ -20,6 +21,7 @@
   "license": "MIT",
   "devDependencies": {
     "@types/node": "^24.6.0",
+    "jest": "^30.4.2",
     "typescript": "^5.9.3"
   },
   "dependencies": {

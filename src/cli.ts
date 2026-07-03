@@ -71,19 +71,24 @@ interface RowInfo {
   isOptionalHoliday: boolean;
   hasBlockingHoliday: boolean;
   tags: string[];
+  loggedParts?: number[];
   loggedHours?: number;
 }
 
-interface EntryRecord {
+interface EntryItem {
   hours: number;
   tags: string[];
+}
+
+interface EntryRecord {
+  items: EntryItem[];
 }
 
 interface AllEntryRecord extends EntryRecord {
   iso: string;
 }
 
-const BASE_DIR = path.join(os.homedir(), ".trak");
+const BASE_DIR = process.env.TRAK_HOME ?? path.join(os.homedir(), ".trak");
 const SETTINGS_PATH = path.join(BASE_DIR, "settings.ini");
 const DATA_DIR = path.join(BASE_DIR, "data");
 const MONTH_ABBR = [
@@ -299,7 +304,7 @@ function parseArgs(argv: string[]): ParsedArgs {
           );
           break;
         }
-        const value = readFlagValue(argv, token, i, errors);
+        const value = readSaveFlagValue(argv, token, i, errors);
         if (value === undefined) {
           break;
         }
@@ -523,6 +528,19 @@ function parseArgs(argv: string[]): ParsedArgs {
   return parsed;
 }
 
+function readSaveFlagValue(
+  argv: string[],
+  flag: string,
+  currentIndex: number,
+  errors: string[],
+): string | undefined {
+  const next = argv[currentIndex + 1];
+  if (next !== undefined && /^-\d/.test(next)) {
+    return next;
+  }
+  return readFlagValue(argv, flag, currentIndex, errors);
+}
+
 function readFlagValue(
   argv: string[],
   flag: string,
@@ -637,7 +655,7 @@ function printUsage(): void {
     "  trak -s 8 -t client                    # log 8h for today tagged \"client\"",
   );
   console.log(
-    "  trak -s 8 -t                           # clear tags for selected save target(s)",
+    "  trak -s 8 -t                           # log 8h untagged, replacing selected day(s)",
   );
   console.log(
     "  trak -s 8 -d 02/25                     # log 8h on Feb 25 (current year, US format)",
@@ -652,7 +670,10 @@ function printUsage(): void {
     "  trak -s 8,7.5,6 -d 2026-12-24          # log across next valid workdays",
   );
   console.log(
-    "  trak -s 8,7.5 -t client,meeting        # apply both tags to every saved entry",
+    "  trak -t ai -d 01.07. -s 3,2,6          # log tagged hours across workdays",
+  );
+  console.log(
+    "  trak -s 8,7.5 -t client,meeting        # apply both tags to each saved entry",
   );
   console.log(
     "  trak -w                                # show current week report",
@@ -1117,26 +1138,27 @@ function applySaveValue(
   tags: string[] | undefined,
 ): void {
   if (value === 0) {
-    const oldValue = clearEntry(date);
+    const oldValue = clearEntry(date, tags);
     printClearResult(date, oldValue);
     return;
   }
-  const oldValue = writeEntry(date, value, tags);
-  printWriteResult(date, value, oldValue);
+  const result = writeEntry(date, value, tags);
+  printWriteResult(date, result.newValue, result.oldValue);
 }
 
 function printWriteResult(
   date: Date,
-  newValue: number,
+  newValue: EntryRecord,
   oldValue: EntryRecord | undefined,
 ): void {
   const iso = formatIsoDate(date);
+  const newHours = entryTotal(newValue);
   if (oldValue === undefined) {
-    console.log(`Saved ${formatHours(newValue)}h on ${iso}.`);
+    console.log(`Saved ${formatHours(newHours)}h on ${iso}.`);
     return;
   }
   console.log(
-    `Updated ${iso}: ${formatHours(oldValue.hours)}h -> ${formatHours(newValue)}h.`,
+    `Updated ${iso}: ${formatHours(entryTotal(oldValue))}h -> ${formatHours(newHours)}h.`,
   );
 }
 
@@ -1146,7 +1168,7 @@ function printClearResult(date: Date, oldValue: EntryRecord | undefined): void {
     console.log(`No entry to clear on ${iso}.`);
     return;
   }
-  console.log(`Cleared ${formatHours(oldValue.hours)}h entry on ${iso}.`);
+  console.log(`Cleared ${formatHours(entryTotal(oldValue))}h entry on ${iso}.`);
 }
 
 function runReport(
@@ -1185,7 +1207,7 @@ function runReport(
   );
   const hoursByRow = rows.map((row) => {
     if (row.loggedHours !== undefined) {
-      return formatHours(row.loggedHours);
+      return formatLoggedParts(row);
     }
     if (!row.isWorkday) {
       return "0";
@@ -1292,11 +1314,11 @@ function buildPeriodContext(
     const holiday = getHolidayInfo(holidayEngine, date);
     const workday = isWorkday(date.getDay(), settings);
     const entry = entries.get(iso);
-    const matchesTagFilter = entry
-      ? entryMatchesTagFilter(entry, parsed.tagFilters)
-      : false;
-    const loggedHours = matchesTagFilter ? entry?.hours : undefined;
-    const tags = matchesTagFilter && entry ? [...entry.tags] : [];
+    const filteredEntry = entry
+      ? filterEntryByTags(entry, parsed.tagFilters)
+      : undefined;
+    const loggedHours = filteredEntry ? entryTotal(filteredEntry) : undefined;
+    const tags = filteredEntry ? entryTags(filteredEntry) : [];
 
     const holidayLabel = holiday.isHoliday
       ? ` (${holiday.name ?? "Holiday"})`
@@ -1314,12 +1336,13 @@ function buildPeriodContext(
       isOptionalHoliday: holiday.isOptionalHoliday,
       hasBlockingHoliday: holiday.hasBlockingHoliday,
       tags,
+      loggedParts: filteredEntry?.items.map((item) => item.hours),
       loggedHours,
     });
 
-    if (entry && matchesTagFilter && loggedHours !== undefined) {
+    if (filteredEntry && loggedHours !== undefined) {
       loggedTotal += loggedHours;
-      addEntryTagsToTotals(tagTotals, entry);
+      addEntryTagsToTotals(tagTotals, filteredEntry);
     }
     if (workday) {
       periodTarget += baselineDaily;
@@ -1363,9 +1386,12 @@ function getCreditedHours(row: RowInfo, baselineDaily: number): number {
 }
 
 function buildExportAllRows(parsed: ParsedArgs, settings: Settings): RowInfo[] {
-  const allEntries = readAllEntries().filter((entry) =>
-    entryMatchesTagFilter(entry, parsed.tagFilters),
-  );
+  const allEntries = readAllEntries()
+    .map((entry) => {
+      const filtered = filterEntryByTags(entry, parsed.tagFilters);
+      return filtered ? { iso: entry.iso, items: filtered.items } : undefined;
+    })
+    .filter((entry): entry is AllEntryRecord => entry !== undefined);
   if (allEntries.length === 0) {
     return [];
   }
@@ -1405,8 +1431,9 @@ function buildExportAllRows(parsed: ParsedArgs, settings: Settings): RowInfo[] {
       holidayType: holiday.type,
       isOptionalHoliday: holiday.isOptionalHoliday,
       hasBlockingHoliday: holiday.hasBlockingHoliday,
-      tags: entry ? [...entry.tags] : [],
-      loggedHours: entry?.hours,
+      tags: entry ? entryTags(entry) : [],
+      loggedParts: entry?.items.map((item) => item.hours),
+      loggedHours: entry ? entryTotal(entry) : undefined,
     });
   }
 
@@ -1508,6 +1535,9 @@ function escapeExportValue(value: string, options: ExportOptions): string {
 function tryCopyToClipboard(
   value: string,
 ): { success: boolean; method?: string } {
+  if (process.env.TRAK_NO_CLIPBOARD) {
+    return { success: false };
+  }
   if (process.platform === "darwin") {
     return runClipboardCommand("pbcopy", [], value, "pbcopy");
   }
@@ -1547,9 +1577,12 @@ function runClipboardCommand(
 }
 
 function runAll(parsed: ParsedArgs, settings: Settings): void {
-  const entries = readAllEntries().filter((entry) =>
-    entryMatchesTagFilter(entry, parsed.tagFilters),
-  );
+  const entries = readAllEntries()
+    .map((entry) => {
+      const filtered = filterEntryByTags(entry, parsed.tagFilters);
+      return filtered ? { iso: entry.iso, items: filtered.items } : undefined;
+    })
+    .filter((entry): entry is AllEntryRecord => entry !== undefined);
   const holidayEngine = createHolidayEngine(settings);
   const rows: RowInfo[] = [];
   const tagTotals = new Map<string, number>();
@@ -1577,10 +1610,11 @@ function runAll(parsed: ParsedArgs, settings: Settings): void {
       holidayType: holiday.type,
       isOptionalHoliday: holiday.isOptionalHoliday,
       hasBlockingHoliday: holiday.hasBlockingHoliday,
-      tags: [...entry.tags],
-      loggedHours: entry.hours,
+      tags: entryTags(entry),
+      loggedParts: entry.items.map((item) => item.hours),
+      loggedHours: entryTotal(entry),
     });
-    totalHours += entry.hours;
+    totalHours += entryTotal(entry);
     addEntryTagsToTotals(tagTotals, entry);
   }
 
@@ -1596,7 +1630,7 @@ function runAll(parsed: ParsedArgs, settings: Settings): void {
     "Day".length,
     ...rows.map((row) => row.label.length),
   );
-  const hoursByRow = rows.map((row) => formatHours(row.loggedHours ?? 0));
+  const hoursByRow = rows.map((row) => formatLoggedParts(row));
   const hoursWidth = Math.max(
     "Hours".length,
     ...hoursByRow.map((value) => value.length),
@@ -1635,25 +1669,41 @@ function runAll(parsed: ParsedArgs, settings: Settings): void {
   printLoggedOnTagLines(tagTotals);
 }
 
-function entryMatchesTagFilter(
+function filterEntryByTags(
   entry: EntryRecord,
+  tagFilters: string[] | undefined,
+): EntryRecord | undefined {
+  const items =
+    !tagFilters || tagFilters.length === 0
+      ? entry.items
+      : entry.items.filter((item) => itemMatchesTagFilter(item, tagFilters));
+  if (items.length === 0) {
+    return undefined;
+  }
+  return { items: items.map(cloneEntryItem) };
+}
+
+function itemMatchesTagFilter(
+  item: EntryItem,
   tagFilters: string[] | undefined,
 ): boolean {
   if (!tagFilters || tagFilters.length === 0) {
     return true;
   }
-  if (entry.tags.length === 0) {
+  if (item.tags.length === 0) {
     return false;
   }
-  return tagFilters.some((tag) => entry.tags.includes(tag));
+  return tagFilters.some((tag) => item.tags.includes(tag));
 }
 
 function addEntryTagsToTotals(
   totals: Map<string, number>,
   entry: EntryRecord,
 ): void {
-  for (const tag of entry.tags) {
-    totals.set(tag, (totals.get(tag) ?? 0) + entry.hours);
+  for (const item of entry.items) {
+    for (const tag of item.tags) {
+      totals.set(tag, (totals.get(tag) ?? 0) + item.hours);
+    }
   }
 }
 
@@ -1907,22 +1957,44 @@ function writeEntry(
   date: Date,
   hours: number,
   tags: string[] | undefined,
-): EntryRecord | undefined {
+): { oldValue: EntryRecord | undefined; newValue: EntryRecord } {
   ensureBaseDirs();
   const filePath = monthFilePath(date);
   const entries = readMonthEntries(filePath);
   const dateIso = formatIsoDate(date);
   const oldValue = entries.get(dateIso);
-  const nextTags = tags !== undefined ? [...tags] : oldValue ? oldValue.tags : [];
-  entries.set(dateIso, {
-    hours,
-    tags: [...nextTags],
-  });
+  const nextItem = { hours, tags: tags ? [...tags] : [] };
+
+  if (!tags || tags.length === 0) {
+    entries.set(dateIso, { items: [nextItem] });
+  } else {
+    const items = oldValue ? oldValue.items.map(cloneEntryItem) : [];
+    const existingIndex = items.findIndex((item) =>
+      sameTags(item.tags, tags),
+    );
+    if (existingIndex >= 0) {
+      items[existingIndex] = nextItem;
+    } else {
+      items.push(nextItem);
+    }
+    entries.set(dateIso, { items });
+  }
+
   writeMonthEntries(filePath, entries);
-  return oldValue ? cloneEntry(oldValue) : undefined;
+  const newValue = entries.get(dateIso);
+  if (!newValue) {
+    throw new Error(`Failed to write entry for ${dateIso}.`);
+  }
+  return {
+    oldValue: oldValue ? cloneEntry(oldValue) : undefined,
+    newValue: cloneEntry(newValue),
+  };
 }
 
-function clearEntry(date: Date): EntryRecord | undefined {
+function clearEntry(
+  date: Date,
+  tags: string[] | undefined,
+): EntryRecord | undefined {
   ensureBaseDirs();
   const filePath = monthFilePath(date);
   if (!fs.existsSync(filePath)) {
@@ -1934,9 +2006,29 @@ function clearEntry(date: Date): EntryRecord | undefined {
   if (oldValue === undefined) {
     return undefined;
   }
-  entries.delete(dateIso);
+  if (!tags || tags.length === 0) {
+    entries.delete(dateIso);
+    writeMonthEntries(filePath, entries);
+    return cloneEntry(oldValue);
+  }
+
+  const removed = oldValue.items.filter((item) =>
+    itemMatchesTagFilter(item, tags),
+  );
+  if (removed.length === 0) {
+    return undefined;
+  }
+
+  const remaining = oldValue.items.filter(
+    (item) => !itemMatchesTagFilter(item, tags),
+  );
+  if (remaining.length === 0) {
+    entries.delete(dateIso);
+  } else {
+    entries.set(dateIso, { items: remaining.map(cloneEntryItem) });
+  }
   writeMonthEntries(filePath, entries);
-  return cloneEntry(oldValue);
+  return { items: removed.map(cloneEntryItem) };
 }
 
 function readAllEntries(): AllEntryRecord[] {
@@ -1962,8 +2054,7 @@ function readAllEntries(): AllEntryRecord[] {
     .sort((a, b) => a[0].localeCompare(b[0]))
     .map(([iso, entry]) => ({
       iso,
-      hours: entry.hours,
-      tags: [...entry.tags],
+      items: entry.items.map(cloneEntryItem),
     }));
 }
 
@@ -2007,10 +2098,16 @@ function readMonthEntries(filePath: string): Map<string, EntryRecord> {
       continue;
     }
 
-    entries.set(dateIso, {
+    const item = {
       hours,
       tags: parseStoredTags(tagsRaw),
-    });
+    };
+    const entry = entries.get(dateIso);
+    if (entry) {
+      entry.items.push(item);
+    } else {
+      entries.set(dateIso, { items: [item] });
+    }
   }
 
   return entries;
@@ -2023,13 +2120,12 @@ function writeMonthEntries(
   const rows = Array.from(entries.entries()).sort((a, b) =>
     a[0].localeCompare(b[0]),
   );
-  const lines = [
-    "date,hours,tags",
-    ...rows.map(
-      ([date, entry]) =>
-        `${date},${formatHours(entry.hours)},${entry.tags.join("|")}`,
-    ),
-  ];
+  const lines = ["date,hours,tags"];
+  for (const [date, entry] of rows) {
+    for (const item of entry.items) {
+      lines.push(`${date},${formatHours(item.hours)},${item.tags.join("|")}`);
+    }
+  }
   fs.writeFileSync(filePath, `${lines.join("\n")}\n`, "utf8");
 }
 
@@ -2055,9 +2151,31 @@ function parseStoredTags(raw: string): string[] {
 
 function cloneEntry(entry: EntryRecord): EntryRecord {
   return {
-    hours: entry.hours,
-    tags: [...entry.tags],
+    items: entry.items.map(cloneEntryItem),
   };
+}
+
+function cloneEntryItem(item: EntryItem): EntryItem {
+  return {
+    hours: item.hours,
+    tags: [...item.tags],
+  };
+}
+
+function entryTotal(entry: EntryRecord): number {
+  return entry.items.reduce((total, item) => total + item.hours, 0);
+}
+
+function entryTags(entry: EntryRecord): string[] {
+  return entry.items.flatMap((item) => item.tags);
+}
+
+function sameTags(a: string[], b: string[]): boolean {
+  if (a.length !== b.length) {
+    return false;
+  }
+  const aTags = new Set(a);
+  return b.every((tag) => aTags.has(tag));
 }
 
 function ensureBaseDirs(): void {
@@ -2092,6 +2210,12 @@ function formatHours(hours: number): string {
     return String(hours);
   }
   return hours.toFixed(2).replace(/\.?0+$/, "");
+}
+
+function formatLoggedParts(row: RowInfo): string {
+  return row.loggedParts && row.loggedParts.length > 0
+    ? row.loggedParts.map(formatHours).join(",")
+    : formatHours(row.loggedHours ?? 0);
 }
 
 function grayText(value: string): string {
