@@ -141,10 +141,10 @@ test("saves explicit date formats, normalizes tags, and sorts all entries", () =
   const all = run(["-a"], home);
   expect(rowFor(all, "2026-07-03")).toMatch(/Fri 2026-07-03\s+1\s*$/);
   expect(rowFor(all, "2026-07-04")).toMatch(
-    /Sat 2026-07-04\s+2.5\s+client\s*$/,
+    /Sat 2026-07-04\s+2.5\s+client \(2.5\)\s*$/,
   );
   expect(rowFor(all, "2026-07-05")).toMatch(
-    /Sun 2026-07-05\s+3\s+admin\s*$/,
+    /Sun 2026-07-05\s+3\s+admin \(3\)\s*$/,
   );
   expect(all).toContain("Total logged: 6.5");
   expect(all.indexOf("2026-07-03")).toBeLessThan(all.indexOf("2026-07-04"));
@@ -201,7 +201,9 @@ test("keeps existing multi-tag save and OR filter behavior", () => {
   expect(exportLine(run(["-x", "-t", "client,other"], home))).toBe("8");
 
   const all = run(["-a"], home);
-  expect(rowFor(all, "2026-07-01")).toMatch(/\s8\s+client,meeting\s*$/);
+  expect(rowFor(all, "2026-07-01")).toMatch(
+    /\s8\s+client \(8\), meeting \(8\)\s*$/,
+  );
   expect(all).toContain("Total logged: 8");
   expect(all).toContain("Logged on client: 8");
   expect(all).toContain("Logged on meeting: 8");
@@ -218,7 +220,7 @@ test("coexisting same-day tags sum for plain export and filter per tag", () => {
 
   const week = run(["-w", "-d", "2026-07-01"], home);
   expect(rowFor(week, "2026-07-01")).toMatch(
-    /Wed 2026-07-01\s+3,4\s+ai,jkc\s*$/,
+    /Wed 2026-07-01\s+7\s+ai \(3\), jkc \(4\)\s*$/,
   );
   expect(week).toContain("Total logged: 24.5");
   expect(week).toContain("Logged on ai: 11");
@@ -226,12 +228,12 @@ test("coexisting same-day tags sum for plain export and filter per tag", () => {
 
   const month = run(["-m", "-d", "2026-07-01"], home);
   expect(rowFor(month, "2026-07-02")).toMatch(
-    /Thu 2026-07-02\s+2,5.5\s+ai,jkc\s*$/,
+    /Thu 2026-07-02\s+7.5\s+ai \(2\), jkc \(5.5\)\s*$/,
   );
 
   const all = run(["-a"], home);
   expect(rowFor(all, "2026-07-03")).toMatch(
-    /Fri 2026-07-03\s+6,4\s+ai,jkc\s*$/,
+    /Fri 2026-07-03\s+10\s+ai \(6\), jkc \(4\)\s*$/,
   );
 });
 
@@ -243,7 +245,7 @@ test("re-saving a tag updates that tag entry without duplicating it", () => {
 
   expect(exportLine(run(["-x"], home))).toBe("4");
   expect(rowFor(run(["-a"], home), "2026-07-01")).toMatch(
-    /Wed 2026-07-01\s+4\s+meeting,client\s*$/,
+    /Wed 2026-07-01\s+4\s+client \(4\), meeting \(4\)\s*$/,
   );
 });
 
@@ -328,8 +330,12 @@ test("tag-filtered week reports calculate totals from matching entries only", ()
 
   const week = run(["-w", "-d", "2026-07-01", "-t", "ai"], home);
 
-  expect(rowFor(week, "2026-07-01")).toMatch(/Wed 2026-07-01\s+3\s+ai\s*$/);
-  expect(rowFor(week, "2026-07-02")).toMatch(/Thu 2026-07-02\s+2\s+ai\s*$/);
+  expect(rowFor(week, "2026-07-01")).toMatch(
+    /Wed 2026-07-01\s+3\s+ai \(3\)\s*$/,
+  );
+  expect(rowFor(week, "2026-07-02")).toMatch(
+    /Thu 2026-07-02\s+2\s+ai \(2\)\s*$/,
+  );
   expect(week).toContain("Total logged: 11");
   expect(week).toContain("Logged on ai: 11");
   expect(week).not.toContain("Logged on jkc");

@@ -70,8 +70,7 @@ interface RowInfo {
   holidayType?: string;
   isOptionalHoliday: boolean;
   hasBlockingHoliday: boolean;
-  tags: string[];
-  loggedParts?: number[];
+  tagSummary?: string;
   loggedHours?: number;
 }
 
@@ -1207,7 +1206,7 @@ function runReport(
   );
   const hoursByRow = rows.map((row) => {
     if (row.loggedHours !== undefined) {
-      return formatLoggedParts(row);
+      return formatHours(row.loggedHours);
     }
     if (!row.isWorkday) {
       return "0";
@@ -1222,7 +1221,7 @@ function runReport(
     "Hours".length,
     ...hoursByRow.map((value) => value.length),
   );
-  const tagsByRow = rows.map((row) => row.tags.join(","));
+  const tagsByRow = rows.map((row) => row.tagSummary ?? "");
   const tagsWidth = Math.max(
     "Tags".length,
     ...tagsByRow.map((value) => value.length),
@@ -1318,7 +1317,6 @@ function buildPeriodContext(
       ? filterEntryByTags(entry, parsed.tagFilters)
       : undefined;
     const loggedHours = filteredEntry ? entryTotal(filteredEntry) : undefined;
-    const tags = filteredEntry ? entryTags(filteredEntry) : [];
 
     const holidayLabel = holiday.isHoliday
       ? ` (${holiday.name ?? "Holiday"})`
@@ -1335,8 +1333,7 @@ function buildPeriodContext(
       holidayType: holiday.type,
       isOptionalHoliday: holiday.isOptionalHoliday,
       hasBlockingHoliday: holiday.hasBlockingHoliday,
-      tags,
-      loggedParts: filteredEntry?.items.map((item) => item.hours),
+      tagSummary: formatEntryTagSummary(filteredEntry),
       loggedHours,
     });
 
@@ -1431,8 +1428,6 @@ function buildExportAllRows(parsed: ParsedArgs, settings: Settings): RowInfo[] {
       holidayType: holiday.type,
       isOptionalHoliday: holiday.isOptionalHoliday,
       hasBlockingHoliday: holiday.hasBlockingHoliday,
-      tags: entry ? entryTags(entry) : [],
-      loggedParts: entry?.items.map((item) => item.hours),
       loggedHours: entry ? entryTotal(entry) : undefined,
     });
   }
@@ -1610,8 +1605,7 @@ function runAll(parsed: ParsedArgs, settings: Settings): void {
       holidayType: holiday.type,
       isOptionalHoliday: holiday.isOptionalHoliday,
       hasBlockingHoliday: holiday.hasBlockingHoliday,
-      tags: entryTags(entry),
-      loggedParts: entry.items.map((item) => item.hours),
+      tagSummary: formatEntryTagSummary(entry),
       loggedHours: entryTotal(entry),
     });
     totalHours += entryTotal(entry);
@@ -1630,12 +1624,12 @@ function runAll(parsed: ParsedArgs, settings: Settings): void {
     "Day".length,
     ...rows.map((row) => row.label.length),
   );
-  const hoursByRow = rows.map((row) => formatLoggedParts(row));
+  const hoursByRow = rows.map((row) => formatHours(row.loggedHours ?? 0));
   const hoursWidth = Math.max(
     "Hours".length,
     ...hoursByRow.map((value) => value.length),
   );
-  const tagsByRow = rows.map((row) => row.tags.join(","));
+  const tagsByRow = rows.map((row) => row.tagSummary ?? "");
   const tagsWidth = Math.max(
     "Tags".length,
     ...tagsByRow.map((value) => value.length),
@@ -1711,6 +1705,17 @@ function sortedTagTotals(tagTotals: Map<string, number>): Array<[string, number]
   return Array.from(tagTotals.entries()).sort((a, b) =>
     a[0].localeCompare(b[0]),
   );
+}
+
+function formatEntryTagSummary(entry: EntryRecord | undefined): string {
+  if (!entry) {
+    return "";
+  }
+  const totals = new Map<string, number>();
+  addEntryTagsToTotals(totals, entry);
+  return sortedTagTotals(totals)
+    .map(([tag, hours]) => `${tag} (${formatHours(hours)})`)
+    .join(", ");
 }
 
 function printLoggedOnTagLines(tagTotals: Map<string, number>): void {
@@ -2166,10 +2171,6 @@ function entryTotal(entry: EntryRecord): number {
   return entry.items.reduce((total, item) => total + item.hours, 0);
 }
 
-function entryTags(entry: EntryRecord): string[] {
-  return entry.items.flatMap((item) => item.tags);
-}
-
 function sameTags(a: string[], b: string[]): boolean {
   if (a.length !== b.length) {
     return false;
@@ -2210,12 +2211,6 @@ function formatHours(hours: number): string {
     return String(hours);
   }
   return hours.toFixed(2).replace(/\.?0+$/, "");
-}
-
-function formatLoggedParts(row: RowInfo): string {
-  return row.loggedParts && row.loggedParts.length > 0
-    ? row.loggedParts.map(formatHours).join(",")
-    : formatHours(row.loggedHours ?? 0);
 }
 
 function grayText(value: string): string {

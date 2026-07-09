@@ -86,7 +86,7 @@ trak -a -t client,meeting              # show all entries filtered by tags
 - `-s 0 -t <tag>` clears matching tagged entries and leaves other tags intact.
 - Multiple tags in `-t` are comma-separated and belong to the same saved entry.
 - Filtering by multiple tags uses OR matching.
-- Reports show multiple same-day entries as comma-separated hours and tags in matching order.
+- Reports show total hours per day and alphabetical tag totals like `ai (6), jkc (2)`.
 - Exports without a tag filter sum same-day entries; exports with `-t` include only matching entries.
 - Per-tag `Logged on <tag>:` lines count full entry hours for each tag.
 
