@@ -104,3 +104,16 @@ trak -a -t client,meeting              # show all entries filtered by tags
 - Free holidays are shown in yellow rows.
 - Optional holidays keep normal row coloring; only the holiday name is gray.
 - Optional holidays are not skipped and do not trigger save warnings.
+
+## Development
+
+Run `npm test` to compile the CLI and run its regression tests.
+
+The `src/` modules separate responsibilities:
+
+- `cli.ts` dispatches commands; `args.ts` parses flags and provides usage text.
+- `settings.ts` manages configuration; `paths.ts` defines the shared storage paths.
+- `dates.ts` handles date parsing and arithmetic; `calendar.ts` handles locales, holidays, and workdays.
+- `entries.ts` contains entry and tag operations; `storage.ts` reads and writes CSV data.
+- `save.ts` handles logging; `reports.ts` builds reports and their shared rows.
+- `output.ts` formats terminal output; `export.ts` renders exports and copies them to the clipboard.

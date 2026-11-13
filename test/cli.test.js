@@ -449,3 +449,59 @@ test("month export applies holiday and nonworkday skipping across a full month",
   expect(fields).toHaveLength(21);
   expect(fields.every((value) => value === "")).toBe(true);
 });
+
+test("long flag aliases support workweeks that wrap across Sunday", () => {
+  const home = createTempHome();
+  run(["-hours", "35", "-locale", "de-rp", "-workweek", "fr-tu"], home);
+  run(["-save", "1,2,3,4,5,6", "-date", "2026-07-02", "-tag", "Client"], home);
+
+  const fields = exportFields(run(["-x", "-se"], home));
+  expect(fields).toEqual(["1", "2", "3", "4", "5", "6"]);
+  expect(rowFor(run(["-all"], home), "2026-07-10")).toMatch(/6\s+client \(6\)/);
+  expect(run(["-week", "-date", "2026-07-03"], home)).toContain("Total logged: 6");
+  expect(run(["-month", "-date", "07.2026"], home)).toContain("Total logged: 21");
+});
+
+test("optional holidays remain eligible for saves and holiday-skipping exports", () => {
+  const home = createTrakHome();
+  const single = runRaw(["-s", "1", "-d", "2026-12-24"], home);
+  expect(single.status).toBe(0);
+  expect(single.stderr).toBe("");
+
+  run(["-s", "2,3", "-d", "2026-12-24"], home);
+  expect(rowFor(run(["-a"], home), "2026-12-28")).toMatch(/\s3\s*$/);
+  const fields = exportFields(
+    run(["-w", "-d", "2026-12-24", "-x", "-sh", "-sn", "-ze"], home),
+  );
+  expect(fields).toEqual(["0", "0", "0", "2"]);
+});
+
+test("legacy settings and CSV entries remain readable and editable", () => {
+  const home = createTempHome();
+  fs.mkdirSync(path.join(home, "data"));
+  fs.writeFileSync(
+    path.join(home, "settings.ini"),
+    "# legacy keys\nhours=40\nholiday_locale=de-rp\nworkweek=mo-fr\n",
+  );
+  const csvPath = path.join(home, "data", "2026_Jul.csv");
+  fs.writeFileSync(
+    csvPath,
+    [
+      "date,hours",
+      "2026-07-01,2",
+      "2026-07-02,3, Client |CLIENT| |Meeting",
+      "2026-07-02,4,ops",
+      "2026-07-03,NaN",
+      "invalid,5",
+      "",
+    ].join("\n"),
+  );
+
+  expect(exportLine(run(["-x"], home))).toBe("2\t7");
+  expect(exportLine(run(["-x", "-t", "meeting"], home))).toBe("3");
+  run(["-s", "5", "-t", "meeting,client", "-d", "2026-07-02"], home);
+  run(["-s", "0", "-t", "ops", "-d", "2026-07-02"], home);
+  expect(fs.readFileSync(csvPath, "utf8")).toBe(
+    "date,hours,tags\n2026-07-01,2,\n2026-07-02,5,meeting|client\n",
+  );
+});
